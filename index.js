@@ -1,5 +1,5 @@
 // index.js
-// Webhook WhatsApp Cloud API + Redirect /go com UTMs (log em CSV) + Relay p/ LeadLovers
+// WhatsApp Cloud API Webhook + Redirect /go -> Google Sheets + Relay LeadLovers
 
 const express = require("express");
 const fs = require("fs");
@@ -7,51 +7,43 @@ const path = require("path");
 
 const app = express();
 
-// ------------ CONFIG ------------
+// --------- CONFIG (via Environment Variables no Render) ----------
 const PORT = process.env.PORT || 3000;
-
-// Token de verificação do webhook (deve bater com o que você colocar na Meta)
-const VERIFY_TOKEN = process.env.WA_VERIFY_TOKEN || "drp_token_123";
-
-// Número de destino (só dígitos, com DDI). Ex.: 5546991305630
+const VERIFY_TOKEN = process.env.WA_VERIFY_TOKEN || "changeme";
 const TARGET_PHONE = process.env.TARGET_PHONE || "5546991305630";
-
-// Mensagem padrão do /go
 const DEFAULT_MESSAGE = process.env.DEFAULT_MESSAGE || "Quero participar do evento";
 
-// Relay LeadLovers
 const LEADLOVERS_URL = process.env.LEADLOVERS_URL || "https://api.zaplovers.com/api/cloudapi/webhooks";
-const LEADLOVERS_TOKEN = process.env.LEADLOVERS_TOKEN || "llwa-a127c9d9";
+const LEADLOVERS_TOKEN = process.env.LEADLOVERS_TOKEN || "";
 
-// Caminho do CSV (atenção: sem disco persistente, isto zera a cada redeploy)
-const LOG_FILE = path.join("/mnt/data", "utm_logs.csv");
+const SHEETS_WEBHOOK_URL = process.env.SHEETS_WEBHOOK_URL || "";
+const SHEETS_SECRET = process.env.SHEETS_SECRET || "";
 
-// ------------ MIDDLEWARES ------------
+const LOG_FILE = path.join("/mnt/data", "utm_logs.csv"); // opcional/volátil no Render
+
+// --------- MIDDLEWARE ----------
 app.use(express.json({ limit: "2mb" }));
 app.use(express.urlencoded({ extended: true }));
 
-// ------------ HEALTH ------------
+// --------- HEALTH ----------
 app.get("/health", (_req, res) => res.status(200).send("ok"));
 
-// ------------ WEBHOOK VERIFICATION (GET) ------------
+// --------- WEBHOOK VERIFICATION (GET) ----------
 app.get("/webhook", (req, res) => {
   const mode = req.query["hub.mode"];
   const token = req.query["hub.verify_token"];
   const challenge = req.query["hub.challenge"];
-
-  if (mode === "subscribe" && token === VERIFY_TOKEN) {
-    return res.status(200).send(challenge);
-  }
+  if (mode === "subscribe" && token === VERIFY_TOKEN) return res.status(200).send(challenge);
   return res.sendStatus(403);
 });
 
-// ------------ WEBHOOK RECEIVER (POST) ------------
+// --------- WEBHOOK RECEIVER (POST) ----------
 app.post("/webhook", async (req, res) => {
   try {
     const body = req.body;
     console.log(">>> WEBHOOK BODY:", JSON.stringify(body, null, 2));
 
-    // (Opcional) Processamento local: extrair info útil (referral de CTWA, etc.)
+    // (Opcional) processamento local
     try {
       if (body?.object === "whatsapp_business_account") {
         for (const entry of body.entry || []) {
@@ -96,8 +88,9 @@ app.post("/webhook", async (req, res) => {
       console.warn("Processamento local falhou (ignorado):", e.message);
     }
 
-    // ---------- Relay para LeadLovers (assíncrono / não bloqueante) ----------
-    (async () => {
+    // Relay para LeadLovers (assíncrono, não bloqueia resposta p/ Meta)
+    ;(async () => {
+      if (!LEADLOVERS_URL || !LEADLOVERS_TOKEN) return;
       try {
         const url = `${LEADLOVERS_URL}?token=${encodeURIComponent(LEADLOVERS_TOKEN)}`;
         const resp = await fetch(url, {
@@ -120,7 +113,7 @@ app.post("/webhook", async (req, res) => {
   }
 });
 
-// ------------ REDIRECT /go (mensagem limpa + log CSV) ------------
+// --------- REDIRECT /go -> salva UTMs no Sheets + CSV e abre WhatsApp ----------
 app.get("/go", (req, res) => {
   const {
     utm_source = "na",
@@ -130,15 +123,43 @@ app.get("/go", (req, res) => {
     utm_term = "na",
   } = req.query;
 
-  // ID curto para conciliação (se quiser remover do texto, pode)
+  // ID curto para conciliação (opcional no texto do usuário)
   const lid = Math.random().toString(36).slice(2, 8).toUpperCase();
 
-  // 1) Salva no CSV (cria cabeçalho se não existir)
+  // Coleta extras úteis
+  const ip = req.headers["x-forwarded-for"]?.split(",")[0]?.trim() || req.socket.remoteAddress || "";
+  const user_agent = req.headers["user-agent"] || "";
+
+  // ----- Envia ao Google Sheets (Apps Script) -----
+  ;(async () => {
+    if (!SHEETS_WEBHOOK_URL) {
+      console.warn("SHEETS_WEBHOOK_URL não configurada");
+      return;
+    }
+    try {
+      const payload = {
+        utm_source, utm_campaign, utm_medium, utm_content, utm_term,
+        lid, ip, user_agent,
+        secret: SHEETS_SECRET
+      };
+      const resp = await fetch(SHEETS_WEBHOOK_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const text = await resp.text();
+      console.log("Sheets webhook:", resp.status, text.slice(0, 200));
+    } catch (err) {
+      console.error("Erro ao enviar ao Sheets:", err.message);
+    }
+  })();
+
+  // ----- (Opcional) também loga em CSV local (volátil no Render) -----
   try {
     if (!fs.existsSync(LOG_FILE)) {
       fs.writeFileSync(
         LOG_FILE,
-        `"timestamp","utm_source","utm_campaign","utm_medium","utm_content","utm_term","lid"\n`
+        `"timestamp","utm_source","utm_campaign","utm_medium","utm_content","utm_term","lid","ip","user_agent"\n`
       );
     }
     const row = [
@@ -149,35 +170,26 @@ app.get("/go", (req, res) => {
       utm_content,
       utm_term,
       lid,
-    ]
-      .map((v) => `"${String(v).replace(/"/g, '""')}"`)
-      .join(",");
-
-    fs.appendFile(LOG_FILE, row + "\n", (err) => {
-      if (err) console.error("Erro ao escrever CSV:", err.message);
-    });
+      ip,
+      user_agent
+    ].map(v => `"${String(v).replace(/"/g, '""')}"`).join(",");
+    fs.appendFile(LOG_FILE, row + "\n", () => {});
   } catch (err) {
     console.error("Erro no log CSV:", err.message);
   }
 
-  // 2) Mensagem limpa pro WhatsApp (com LID opcional)
-  const msg = `${DEFAULT_MESSAGE} [LID:${lid}]`; // se não quiser LID, use: const msg = DEFAULT_MESSAGE;
-
+  // Mensagem limpa para o usuário (se não quiser mostrar LID, remova o [LID:...])
+  const msg = `${DEFAULT_MESSAGE} [LID:${lid}]`;
   const waUrl = `https://wa.me/${TARGET_PHONE}?text=${encodeURIComponent(msg)}`;
 
-  console.log(">>> REDIRECT -> WHATSAPP (logged)", {
-    utm_source,
-    utm_campaign,
-    utm_medium,
-    utm_content,
-    utm_term,
-    lid,
+  console.log(">>> REDIRECT -> WHATSAPP (logged+sheet)", {
+    utm_source, utm_campaign, utm_medium, utm_content, utm_term, lid
   });
 
   return res.redirect(302, waUrl);
 });
 
-// ------------ START ------------
+// --------- START ----------
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
   console.log(`Health: http://localhost:${PORT}/health`);
