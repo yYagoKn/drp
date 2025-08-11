@@ -1,5 +1,5 @@
 // index.js
-// WhatsApp Cloud API Webhook + Redirect /go -> Google Sheets + Relay LeadLovers (sem LID)
+// Fluxo: grava no Sheets somente após a 1ª mensagem (casando código #ABCDE com UTMs)
 
 const express = require("express");
 const fs = require("fs");
@@ -7,7 +7,7 @@ const path = require("path");
 
 const app = express();
 
-// --------- CONFIG (via Environment Variables no Render) ----------
+// --------- CONFIG (env) ----------
 const PORT = process.env.PORT || 3000;
 const VERIFY_TOKEN = process.env.WA_VERIFY_TOKEN || "changeme";
 const TARGET_PHONE = process.env.TARGET_PHONE || "5546991305630";
@@ -16,13 +16,30 @@ const DEFAULT_MESSAGE = process.env.DEFAULT_MESSAGE || "Quero participar do even
 const LEADLOVERS_URL = process.env.LEADLOVERS_URL || "https://api.zaplovers.com/api/cloudapi/webhooks";
 const LEADLOVERS_TOKEN = process.env.LEADLOVERS_TOKEN || "";
 
-const SHEETS_WEBHOOK_URL = process.env.SHEETS_WEBHOOK_URL || ""; // Apps Script Web App (/exec)
+const SHEETS_WEBHOOK_URL = process.env.SHEETS_WEBHOOK_URL || "";
 const SHEETS_SECRET = process.env.SHEETS_SECRET || "";
 
-const LOG_FILE = path.join("/mnt/data", "utm_logs.csv"); // opcional/volátil no Render
+const CODE_TTL_SECONDS = parseInt(process.env.CODE_TTL_SECONDS || "86400", 10); // 24h
+const LOG_FILE = path.join("/mnt/data", "utm_click_buffer.csv"); // opcional/volátil
 
-// memória simples p/ debounce
-global.__lastHits = global.__lastHits || new Map();
+// Buffers em memória: code -> {utms, ip, ua, ts}
+global.__utmBuffer = global.__utmBuffer || new Map();
+global.__lastHits = global.__lastHits || new Map(); // debounce
+
+// --------- HELPERS ----------
+function genCode(len = 5) {
+  return Array.from({ length: len })
+    .map(() => Math.random().toString(36).slice(2, 3))
+    .join("")
+    .toUpperCase();
+}
+function nowSec() { return Math.floor(Date.now() / 1000); }
+function purgeExpired() {
+  const now = nowSec();
+  for (const [code, rec] of global.__utmBuffer.entries()) {
+    if (now - rec.ts > CODE_TTL_SECONDS) global.__utmBuffer.delete(code);
+  }
+}
 
 // --------- MIDDLEWARE ----------
 app.use(express.json({ limit: "2mb" }));
@@ -46,49 +63,95 @@ app.post("/webhook", async (req, res) => {
     const body = req.body;
     console.log(">>> WEBHOOK BODY:", JSON.stringify(body, null, 2));
 
-    try {
-      if (body?.object === "whatsapp_business_account") {
-        for (const entry of body.entry || []) {
-          for (const change of entry.changes || []) {
-            const data = change.value || {};
+    if (body?.object === "whatsapp_business_account") {
+      for (const entry of body.entry || []) {
+        for (const change of entry.changes || []) {
+          const data = change.value || {};
 
-            for (const msg of data.messages || []) {
-              const from = msg.from;
-              const text = msg.text?.body;
-              console.log(">>> INCOMING:", { from, text });
+          // Mensagens recebidas
+          for (const msg of data.messages || []) {
+            const from = msg.from; // telefone do lead
+            const text = msg.text?.body || "";
 
-              if (msg.referral) {
-                const r = msg.referral;
-                console.log(">>> CTWA REFERRAL:", {
-                  source_type: r.source_type,
-                  source_url: r.source_url,
-                  headline: r.headline,
-                  body: r.body,
-                  media_type: r.media_type,
-                  media_url: r.media_url,
-                  ad_id: r.ad_id || r.ads_id || null,
-                });
+            console.log(">>> INCOMING:", { from, text });
+
+            // 1) extrair #CODE do texto (ex.: "#A1B2C")
+            const match = text.match(/#([A-Z0-9]{4,8})\b/i);
+            if (match) {
+              const code = match[1].toUpperCase();
+              purgeExpired();
+              const rec = global.__utmBuffer.get(code);
+
+              if (rec) {
+                // 2) montar payload p/ Sheets
+                const payload = {
+                  secret: SHEETS_SECRET,
+                  code,
+                  phone: from,
+                  utm_source: rec.utm_source,
+                  utm_campaign: rec.utm_campaign,
+                  utm_medium: rec.utm_medium,
+                  utm_content: rec.utm_content,
+                  utm_term: rec.utm_term,
+                  ip: rec.ip || "",
+                  user_agent: rec.user_agent || ""
+                };
+
+                // 3) enviar ao Apps Script (Sheets)
+                try {
+                  if (!SHEETS_WEBHOOK_URL) {
+                    console.warn("SHEETS_WEBHOOK_URL não configurada");
+                  } else {
+                    const resp = await fetch(SHEETS_WEBHOOK_URL, {
+                      method: "POST",
+                      headers: { "Content-Type": "application/json" },
+                      body: JSON.stringify(payload),
+                    });
+                    const txt = await resp.text();
+                    console.log("Sheets webhook (message-link):", resp.status, txt.slice(0, 200));
+                  }
+                } catch (err) {
+                  console.error("Erro ao enviar ao Sheets:", err.message);
+                }
+
+                // 4) remove o código (evita duplicar)
+                global.__utmBuffer.delete(code);
+              } else {
+                console.log(">>> CODE não encontrado/expirado:", code);
               }
             }
 
-            for (const st of data.statuses || []) {
-              console.log(">>> MESSAGE STATUS:", {
-                id: st.id,
-                status: st.status,
-                recipient_id: st.recipient_id,
-                timestamp: st.timestamp,
-                conversation: st.conversation,
-                pricing: st.pricing,
+            // CTWA referral (extra)
+            if (msg.referral) {
+              const r = msg.referral;
+              console.log(">>> CTWA REFERRAL:", {
+                source_type: r.source_type,
+                source_url: r.source_url,
+                headline: r.headline,
+                body: r.body,
+                media_type: r.media_type,
+                media_url: r.media_url,
+                ad_id: r.ad_id || r.ads_id || null,
               });
             }
           }
+
+          // Status (delivered/read/etc.)
+          for (const st of data.statuses || []) {
+            console.log(">>> MESSAGE STATUS:", {
+              id: st.id,
+              status: st.status,
+              recipient_id: st.recipient_id,
+              timestamp: st.timestamp,
+              conversation: st.conversation,
+              pricing: st.pricing,
+            });
+          }
         }
       }
-    } catch (e) {
-      console.warn("Processamento local falhou (ignorado):", e.message);
     }
 
-    // Relay para LeadLovers (assíncrono)
+    // Relay para LeadLovers (assíncrono, não bloqueia 200)
     ;(async () => {
       if (!LEADLOVERS_URL || !LEADLOVERS_TOKEN) return;
       try {
@@ -112,21 +175,21 @@ app.post("/webhook", async (req, res) => {
   }
 });
 
-// --------- REDIRECT /go -> proteções + Sheets + CSV + WhatsApp (sem LID) ----------
+// --------- REDIRECT /go -> gera #CODE, salva UTMs com TTL, abre WhatsApp ----------
 app.get("/go", (req, res) => {
-  // 0) Exigir clique “real” com track=1
+  // requer clique real
   const doTrack = req.query.track === "1";
 
-  // 1) Filtrar bots/preview por User-Agent
+  // filtro de bots
   const ua = (req.headers["user-agent"] || "").toLowerCase();
   const botUAs = [
-    "facebookexternalhit", "whatsapp", "meta-external", "slackbot",
-    "twitterbot", "linkedinbot", "skypeuripreview", "googlebot",
-    "curl", "python-requests", "uptime", "pingdom", "monitor", "preview"
+    "facebookexternalhit","whatsapp","meta-external","slackbot",
+    "twitterbot","linkedinbot","skypeuripreview","googlebot",
+    "curl","python-requests","uptime","pingdom","monitor","preview"
   ];
   const isBot = botUAs.some(sig => ua.includes(sig));
 
-  // 2) Coleta UTMs (mesmo se não for track, para montar URL)
+  // UTMs
   const {
     utm_source = "na",
     utm_campaign = "na",
@@ -135,14 +198,14 @@ app.get("/go", (req, res) => {
     utm_term = "na",
   } = req.query;
 
-  // 3) IP e debounce
+  // debounce 30s por IP+UTMs
   const ip = (req.headers["x-forwarded-for"]?.split(",")[0] || req.socket.remoteAddress || "").trim();
   const key = `${ip}|${utm_source}|${utm_campaign}|${utm_medium}|${utm_content}|${utm_term}`;
   const now = Date.now();
   const last = global.__lastHits.get(key) || 0;
   const within30s = now - last < 30_000;
 
-  // se não deve trackear, se for bot, ou se cair no debounce — só redireciona, sem log
+  // se não for track/bot/debounce: abre WhatsApp sem salvar nada
   if (!doTrack || isBot || within30s) {
     const msg = `${DEFAULT_MESSAGE}`;
     const waUrl = `https://wa.me/${TARGET_PHONE}?text=${encodeURIComponent(msg)}`;
@@ -152,67 +215,43 @@ app.get("/go", (req, res) => {
     return res.redirect(302, waUrl);
   }
 
-  // marca o hit p/ debounce
+  // marca hit p/ debounce
   global.__lastHits.set(key, now);
 
-  // ---- fluxo com track válido ----
-  const user_agent = req.headers["user-agent"] || "";
+  // gerar código curto e salvar no buffer com TTL
+  const code = genCode(5); // ex.: A1B2C
+  purgeExpired();
+  global.__utmBuffer.set(code, {
+    utm_source, utm_campaign, utm_medium, utm_content, utm_term,
+    ip, user_agent: req.headers["user-agent"] || "",
+    ts: nowSec(),
+  });
 
-  // Envio ao Google Sheets (Apps Script)
-  ;(async () => {
-    if (!SHEETS_WEBHOOK_URL) {
-      console.warn("SHEETS_WEBHOOK_URL não configurada");
-      return;
-    }
-    try {
-      const payload = {
-        utm_source, utm_campaign, utm_medium, utm_content, utm_term,
-        ip, user_agent,
-        phone: TARGET_PHONE,
-        secret: SHEETS_SECRET
-      };
-      const resp = await fetch(SHEETS_WEBHOOK_URL, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
-      const text = await resp.text();
-      console.log("Sheets webhook:", resp.status, text.slice(0, 200));
-    } catch (err) {
-      console.error("Erro ao enviar ao Sheets:", err.message);
-    }
-  })();
-
-  // (Opcional) CSV local
+  // opcional: log em CSV (volátil)
   try {
     if (!fs.existsSync(LOG_FILE)) {
       fs.writeFileSync(
         LOG_FILE,
-        `"timestamp","utm_source","utm_campaign","utm_medium","utm_content","utm_term","ip","user_agent","phone"\n`
+        `"timestamp","code","utm_source","utm_campaign","utm_medium","utm_content","utm_term","ip","user_agent"\n`
       );
     }
     const row = [
       new Date().toISOString(),
-      utm_source,
-      utm_campaign,
-      utm_medium,
-      utm_content,
-      utm_term,
-      ip,
-      user_agent,
-      TARGET_PHONE
+      code,
+      utm_source, utm_campaign, utm_medium, utm_content, utm_term,
+      ip, req.headers["user-agent"] || ""
     ].map(v => `"${String(v).replace(/"/g, '""')}"`).join(",");
     fs.appendFile(LOG_FILE, row + "\n", () => {});
   } catch (err) {
     console.error("Erro no log CSV:", err.message);
   }
 
-  // Mensagem ao usuário (limpa)
-  const msg = `${DEFAULT_MESSAGE}`;
+  // mensagem com código (precisa do #CODE para casar depois)
+  const msg = `${DEFAULT_MESSAGE} #${code}`;
   const waUrl = `https://wa.me/${TARGET_PHONE}?text=${encodeURIComponent(msg)}`;
 
-  console.log(">>> REDIRECT -> WHATSAPP (tracked, sem LID)", {
-    utm_source, utm_campaign, utm_medium, utm_content, utm_term
+  console.log(">>> REDIRECT -> WHATSAPP (buffered)", {
+    code, utm_source, utm_campaign, utm_medium, utm_content, utm_term
   });
 
   return res.redirect(302, waUrl);
