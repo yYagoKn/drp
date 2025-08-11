@@ -1,5 +1,5 @@
 // index.js
-// Fluxo: grava no Sheets somente após a 1ª mensagem (casando código #ABCDE com UTMs)
+// Fluxo: grava no Sheets somente após a 1ª mensagem (casando #CODE com UTMs) + pede nome
 
 const express = require("express");
 const fs = require("fs");
@@ -12,7 +12,7 @@ const PORT = process.env.PORT || 3000;
 const VERIFY_TOKEN = process.env.WA_VERIFY_TOKEN || "changeme";
 const TARGET_PHONE = process.env.TARGET_PHONE || "5546991305630";
 
-// template com placeholder {code}; substituímos na hora de montar a mensagem
+// Template com placeholder {code}; substituímos na hora de montar a mensagem
 const DEFAULT_MESSAGE =
   process.env.DEFAULT_MESSAGE ||
   "Quero participar do evento, meu código é #{code} - *Envie o código para confirmar sua inscrição!*";
@@ -23,14 +23,17 @@ const LEADLOVERS_TOKEN = process.env.LEADLOVERS_TOKEN || "";
 const SHEETS_WEBHOOK_URL = process.env.SHEETS_WEBHOOK_URL || "";
 const SHEETS_SECRET = process.env.SHEETS_SECRET || "";
 
+const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN || "";          // para enviar respostas automáticas
+const WA_PHONE_NUMBER_ID_ENV = process.env.WA_PHONE_NUMBER_ID || ""; // opcional
+
 const CODE_TTL_SECONDS = parseInt(process.env.CODE_TTL_SECONDS || "86400", 10); // 24h
 const LOG_FILE = path.join("/mnt/data", "utm_click_buffer.csv"); // opcional/volátil
 
 // Buffers em memória
 global.__utmBuffer = global.__utmBuffer || new Map(); // code -> {utms, ip, ua, ts}
 global.__lastHits = global.__lastHits || new Map();   // debounce
+global.__nameWait = global.__nameWait || new Map();   // phone -> { code, utms..., ts }
 
-// --------- HELPERS ----------
 function genCode(len = 5) {
   return Array.from({ length: len })
     .map(() => Math.random().toString(36).slice(2, 3))
@@ -42,6 +45,32 @@ function purgeExpired() {
   const now = nowSec();
   for (const [code, rec] of global.__utmBuffer.entries()) {
     if (now - rec.ts > CODE_TTL_SECONDS) global.__utmBuffer.delete(code);
+  }
+}
+function purgeNameWait(ttlSeconds = 86400) {
+  const now = nowSec();
+  for (const [phone, rec] of global.__nameWait.entries()) {
+    if (now - rec.ts > ttlSeconds) global.__nameWait.delete(phone);
+  }
+}
+
+async function sendWhatsappText(to, body, phoneNumberIdFromWebhook) {
+  if (!WHATSAPP_TOKEN) return; // sem token, não responde
+  const phoneNumberId = WA_PHONE_NUMBER_ID_ENV || phoneNumberIdFromWebhook;
+  if (!phoneNumberId) return console.warn("Sem WA_PHONE_NUMBER_ID; não enviarei resposta.");
+  try {
+    const resp = await fetch(`https://graph.facebook.com/v20.0/${phoneNumberId}/messages`, {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${WHATSAPP_TOKEN}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        messaging_product: "whatsapp",
+        to,
+        text: { body }
+      })
+    });
+    console.log("Send WA msg:", resp.status, await resp.text());
+  } catch (e) {
+    console.error("Erro send WA:", e.message);
   }
 }
 
@@ -71,57 +100,94 @@ app.post("/webhook", async (req, res) => {
       for (const entry of body.entry || []) {
         for (const change of entry.changes || []) {
           const data = change.value || {};
+          const phoneNumberIdFromWebhook = data.metadata?.phone_number_id;
 
           // Mensagens recebidas
           for (const msg of data.messages || []) {
-            const from = msg.from; // telefone do lead
+            const from = msg.from;              // telefone do lead
             const text = msg.text?.body || "";
-
             console.log(">>> INCOMING:", { from, text });
 
-            // extrair #CODE do texto
-            const match = text.match(/#([A-Z0-9]{4,8})\b/i);
-            if (match) {
-              const code = match[1].toUpperCase();
-              purgeExpired();
+            // 1) Se a mensagem tem #CODE → guardar pendência e pedir nome
+            const codeMatch = text.match(/#([A-Z0-9]{4,8})\b/i);
+            if (codeMatch) {
+              const code = codeMatch[1].toUpperCase();
+              purgeExpired(); // limpa buffer de cliques expirados
               const rec = global.__utmBuffer.get(code);
-
               if (rec) {
-                // payload -> Sheets
-                const payload = {
-                  secret: SHEETS_SECRET,
+                global.__nameWait.set(from, {
                   code,
-                  phone: from,
                   utm_source: rec.utm_source,
                   utm_campaign: rec.utm_campaign,
                   utm_medium: rec.utm_medium,
                   utm_content: rec.utm_content,
                   utm_term: rec.utm_term,
                   ip: rec.ip || "",
-                  user_agent: rec.user_agent || ""
-                };
+                  user_agent: rec.user_agent || "",
+                  ts: nowSec()
+                });
 
-                try {
-                  if (!SHEETS_WEBHOOK_URL) {
-                    console.warn("SHEETS_WEBHOOK_URL não configurada");
-                  } else {
-                    const resp = await fetch(SHEETS_WEBHOOK_URL, {
-                      method: "POST",
-                      headers: { "Content-Type": "application/json" },
-                      body: JSON.stringify(payload),
-                    });
-                    const txt = await resp.text();
-                    console.log("Sheets webhook (message-link):", resp.status, txt.slice(0, 200));
-                  }
-                } catch (err) {
-                  console.error("Erro ao enviar ao Sheets:", err.message);
-                }
+                // pede o nome (se tiver token)
+                await sendWhatsappText(
+                  from,
+                  "Sua inscrição foi confirmada! Para receber o link do grupo, digite seu nome completo.",
+                  phoneNumberIdFromWebhook
+                );
 
-                // evita duplicar
+                // remove o code do buffer para não reutilizar
                 global.__utmBuffer.delete(code);
+                continue; // não envia ao Sheets ainda
               } else {
                 console.log(">>> CODE não encontrado/expirado:", code);
               }
+            }
+
+            // 2) Se NÃO tem #CODE, mas existe pendência para este phone → tratar como nome
+            purgeNameWait();
+            const pending = global.__nameWait.get(from);
+            if (pending) {
+              const name = text.trim().slice(0, 120); // limite básico
+
+              // montar payload para Sheets com name
+              const payload = {
+                secret: SHEETS_SECRET,
+                code: pending.code,
+                phone: from,
+                name,
+                utm_source: pending.utm_source,
+                utm_campaign: pending.utm_campaign,
+                utm_medium: pending.utm_medium,
+                utm_content: pending.utm_content,
+                utm_term: pending.utm_term,
+                ip: pending.ip,
+                user_agent: pending.user_agent
+              };
+
+              try {
+                if (!SHEETS_WEBHOOK_URL) {
+                  console.warn("SHEETS_WEBHOOK_URL não configurada");
+                } else {
+                  const resp = await fetch(SHEETS_WEBHOOK_URL, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify(payload),
+                  });
+                  console.log("Sheets webhook (name):", resp.status, await resp.text());
+                }
+              } catch (err) {
+                console.error("Erro ao enviar nome ao Sheets:", err.message);
+              }
+
+              // confirma ao usuário (opcional)
+              await sendWhatsappText(
+                from,
+                "Perfeito, obrigado! Em instantes você receberá o link do grupo. ✅",
+                phoneNumberIdFromWebhook
+              );
+
+              // limpar pendência
+              global.__nameWait.delete(from);
+              continue;
             }
 
             // CTWA referral (extra)
@@ -182,14 +248,14 @@ app.post("/webhook", async (req, res) => {
 app.get("/go", (req, res) => {
   const doTrack = req.query.track === "1";
 
-  // filtro de bots
+  // filtro de bots (não bloqueia WhatsApp)
   const ua = (req.headers["user-agent"] || "").toLowerCase();
   const botUAs = [
-  "facebookexternalhit", "meta-external", "slackbot",
-  "twitterbot", "linkedinbot", "skypeuripreview", "googlebot",
-  "curl", "python-requests", "uptime", "pingdom", "monitor"
-];
-const isBot = botUAs.some(sig => ua.includes(sig));
+    "facebookexternalhit","meta-external","slackbot",
+    "twitterbot","linkedinbot","skypeuripreview","googlebot",
+    "curl","python-requests","uptime","pingdom","monitor"
+  ];
+  const isBot = botUAs.some(sig => ua.includes(sig));
 
   // UTMs
   const {
