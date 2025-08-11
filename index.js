@@ -9,22 +9,26 @@ const app = express();
 
 // --------- CONFIG (env) ----------
 const PORT = process.env.PORT || 3000;
-const VERIFY_TOKEN = process.env.WA_VERIFY_TOKEN || "KSdie832nNS2332Si340AsN";
+const VERIFY_TOKEN = process.env.WA_VERIFY_TOKEN || "changeme";
 const TARGET_PHONE = process.env.TARGET_PHONE || "5546991305630";
-const DEFAULT_MESSAGE = process.env.DEFAULT_MESSAGE || "Quero participar do evento";
+
+// template com placeholder {code}; substituímos na hora de montar a mensagem
+const DEFAULT_MESSAGE =
+  process.env.DEFAULT_MESSAGE ||
+  "Quero participar do evento, meu código é #{code} - *Envie o código para confirmar sua inscrição!*";
 
 const LEADLOVERS_URL = process.env.LEADLOVERS_URL || "https://api.zaplovers.com/api/cloudapi/webhooks";
-const LEADLOVERS_TOKEN = process.env.LEADLOVERS_TOKEN || "llwa-a127c9d9";
+const LEADLOVERS_TOKEN = process.env.LEADLOVERS_TOKEN || "";
 
-const SHEETS_WEBHOOK_URL = process.env.SHEETS_WEBHOOK_URL || "https://script.google.com/macros/s/AKfycbxshqYTfQw7j9OdBmWdqUR1gCS2RQNNOKloSgCKP7l9q_eu4paE4JonI8B_dK3x4eY0lg/exec";
-const SHEETS_SECRET = process.env.SHEETS_SECRET || "gu1t4r_h34v1m3t4l765";
+const SHEETS_WEBHOOK_URL = process.env.SHEETS_WEBHOOK_URL || "";
+const SHEETS_SECRET = process.env.SHEETS_SECRET || "";
 
 const CODE_TTL_SECONDS = parseInt(process.env.CODE_TTL_SECONDS || "86400", 10); // 24h
 const LOG_FILE = path.join("/mnt/data", "utm_click_buffer.csv"); // opcional/volátil
 
-// Buffers em memória: code -> {utms, ip, ua, ts}
-global.__utmBuffer = global.__utmBuffer || new Map();
-global.__lastHits = global.__lastHits || new Map(); // debounce
+// Buffers em memória
+global.__utmBuffer = global.__utmBuffer || new Map(); // code -> {utms, ip, ua, ts}
+global.__lastHits = global.__lastHits || new Map();   // debounce
 
 // --------- HELPERS ----------
 function genCode(len = 5) {
@@ -75,7 +79,7 @@ app.post("/webhook", async (req, res) => {
 
             console.log(">>> INCOMING:", { from, text });
 
-            // 1) extrair #CODE do texto (ex.: "#A1B2C")
+            // extrair #CODE do texto
             const match = text.match(/#([A-Z0-9]{4,8})\b/i);
             if (match) {
               const code = match[1].toUpperCase();
@@ -83,7 +87,7 @@ app.post("/webhook", async (req, res) => {
               const rec = global.__utmBuffer.get(code);
 
               if (rec) {
-                // 2) montar payload p/ Sheets
+                // payload -> Sheets
                 const payload = {
                   secret: SHEETS_SECRET,
                   code,
@@ -97,7 +101,6 @@ app.post("/webhook", async (req, res) => {
                   user_agent: rec.user_agent || ""
                 };
 
-                // 3) enviar ao Apps Script (Sheets)
                 try {
                   if (!SHEETS_WEBHOOK_URL) {
                     console.warn("SHEETS_WEBHOOK_URL não configurada");
@@ -114,7 +117,7 @@ app.post("/webhook", async (req, res) => {
                   console.error("Erro ao enviar ao Sheets:", err.message);
                 }
 
-                // 4) remove o código (evita duplicar)
+                // evita duplicar
                 global.__utmBuffer.delete(code);
               } else {
                 console.log(">>> CODE não encontrado/expirado:", code);
@@ -151,7 +154,7 @@ app.post("/webhook", async (req, res) => {
       }
     }
 
-    // Relay para LeadLovers (assíncrono, não bloqueia 200)
+    // Relay para LeadLovers (assíncrono)
     ;(async () => {
       if (!LEADLOVERS_URL || !LEADLOVERS_TOKEN) return;
       try {
@@ -177,7 +180,6 @@ app.post("/webhook", async (req, res) => {
 
 // --------- REDIRECT /go -> gera #CODE, salva UTMs com TTL, abre WhatsApp ----------
 app.get("/go", (req, res) => {
-  // requer clique real
   const doTrack = req.query.track === "1";
 
   // filtro de bots
@@ -205,10 +207,10 @@ app.get("/go", (req, res) => {
   const last = global.__lastHits.get(key) || 0;
   const within30s = now - last < 30_000;
 
-  // se não for track/bot/debounce: abre WhatsApp sem salvar nada
+  // caso sem track/bot/debounce: mensagem limpa (sem código)
   if (!doTrack || isBot || within30s) {
-    const msg = `${DEFAULT_MESSAGE}`;
-    const waUrl = `https://wa.me/${TARGET_PHONE}?text=${encodeURIComponent(msg)}`;
+    const cleanMsg = "Quero participar do evento";
+    const waUrl = `https://wa.me/${TARGET_PHONE}?text=${encodeURIComponent(cleanMsg)}`;
     if (!doTrack) console.log(">>> /go sem track (track!=1) -> redirect-only");
     else if (isBot) console.log(">>> /go bloqueado por User-Agent de bot:", ua);
     else console.log(">>> /go debounce (mesmo IP+UTMs <30s)");
@@ -218,7 +220,7 @@ app.get("/go", (req, res) => {
   // marca hit p/ debounce
   global.__lastHits.set(key, now);
 
-  // gerar código curto e salvar no buffer com TTL
+  // gerar código curto e salvar no buffer
   const code = genCode(5); // ex.: A1B2C
   purgeExpired();
   global.__utmBuffer.set(code, {
@@ -227,7 +229,7 @@ app.get("/go", (req, res) => {
     ts: nowSec(),
   });
 
-  // opcional: log em CSV (volátil)
+  // opcional: log de clique em CSV (volátil)
   try {
     if (!fs.existsSync(LOG_FILE)) {
       fs.writeFileSync(
@@ -246,8 +248,8 @@ app.get("/go", (req, res) => {
     console.error("Erro no log CSV:", err.message);
   }
 
-  // mensagem com código (precisa do #CODE para casar depois)
-  const msg = `${DEFAULT_MESSAGE} #${code}`;
+  // mensagem com o código aplicado ao template
+  const msg = DEFAULT_MESSAGE.replace("{code}", code);
   const waUrl = `https://wa.me/${TARGET_PHONE}?text=${encodeURIComponent(msg)}`;
 
   console.log(">>> REDIRECT -> WHATSAPP (buffered)", {
