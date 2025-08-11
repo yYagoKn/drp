@@ -185,11 +185,11 @@ app.get("/go", (req, res) => {
   // filtro de bots
   const ua = (req.headers["user-agent"] || "").toLowerCase();
   const botUAs = [
-    "facebookexternalhit","whatsapp","meta-external","slackbot",
-    "twitterbot","linkedinbot","skypeuripreview","googlebot",
-    "curl","python-requests","uptime","pingdom","monitor","preview"
-  ];
-  const isBot = botUAs.some(sig => ua.includes(sig));
+  "facebookexternalhit", "meta-external", "slackbot",
+  "twitterbot", "linkedinbot", "skypeuripreview", "googlebot",
+  "curl", "python-requests", "uptime", "pingdom", "monitor"
+];
+const isBot = botUAs.some(sig => ua.includes(sig));
 
   // UTMs
   const {
