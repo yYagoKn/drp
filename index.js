@@ -16,7 +16,7 @@ const DEFAULT_MESSAGE = process.env.DEFAULT_MESSAGE || "Quero participar do even
 const LEADLOVERS_URL = process.env.LEADLOVERS_URL || "https://api.zaplovers.com/api/cloudapi/webhooks";
 const LEADLOVERS_TOKEN = process.env.LEADLOVERS_TOKEN || "llwa-a127c9d9";
 
-const SHEETS_WEBHOOK_URL = process.env.SHEETS_WEBHOOK_URL || "https://script.google.com/macros/s/AKfycby-S6GpEX7k8XkrlPDlw-r7BkOd6RTgJPFD-CXzvoyB0VJrgxwziM9LSIvl9mC-V0336g/exec";
+const SHEETS_WEBHOOK_URL = process.env.SHEETS_WEBHOOK_URL || "https://script.google.com/macros/s/AKfycbxshqYTfQw7j9OdBmWdqUR1gCS2RQNNOKloSgCKP7l9q_eu4paE4JonI8B_dK3x4eY0lg/exec";
 const SHEETS_SECRET = process.env.SHEETS_SECRET || "gu1t4r_h34v1m3t4l765";
 
 const CODE_TTL_SECONDS = parseInt(process.env.CODE_TTL_SECONDS || "86400", 10); // 24h
