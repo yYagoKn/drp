@@ -16,7 +16,7 @@ const DEFAULT_MESSAGE = process.env.DEFAULT_MESSAGE || "Quero participar do even
 const LEADLOVERS_URL = process.env.LEADLOVERS_URL || "https://api.zaplovers.com/api/cloudapi/webhooks";
 const LEADLOVERS_TOKEN = process.env.LEADLOVERS_TOKEN || "";
 
-const SHEETS_WEBHOOK_URL = process.env.SHEETS_WEBHOOK_URL || "";
+const SHEETS_WEBHOOK_URL = process.env.SHEETS_WEBHOOK_URL || ""; // <-- coloque o novo /exec no Render
 const SHEETS_SECRET = process.env.SHEETS_SECRET || "";
 
 const LOG_FILE = path.join("/mnt/data", "utm_logs.csv"); // opcional/volátil no Render
@@ -140,6 +140,7 @@ app.get("/go", (req, res) => {
       const payload = {
         utm_source, utm_campaign, utm_medium, utm_content, utm_term,
         lid, ip, user_agent,
+        phone: TARGET_PHONE,   // <-- telefone enviado para a planilha
         secret: SHEETS_SECRET
       };
       const resp = await fetch(SHEETS_WEBHOOK_URL, {
@@ -159,7 +160,7 @@ app.get("/go", (req, res) => {
     if (!fs.existsSync(LOG_FILE)) {
       fs.writeFileSync(
         LOG_FILE,
-        `"timestamp","utm_source","utm_campaign","utm_medium","utm_content","utm_term","lid","ip","user_agent"\n`
+        `"timestamp","utm_source","utm_campaign","utm_medium","utm_content","utm_term","lid","ip","user_agent","phone"\n`
       );
     }
     const row = [
@@ -171,7 +172,8 @@ app.get("/go", (req, res) => {
       utm_term,
       lid,
       ip,
-      user_agent
+      user_agent,
+      TARGET_PHONE
     ].map(v => `"${String(v).replace(/"/g, '""')}"`).join(",");
     fs.appendFile(LOG_FILE, row + "\n", () => {});
   } catch (err) {
