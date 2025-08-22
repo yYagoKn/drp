@@ -1,7 +1,6 @@
 // index.js
-// WhatsApp → Captura de código/UTMs (sem CTWA) → pede NOME → salva em Sheets e envia para Leadlovers
-// Depois confirma + link do grupo e ignora mensagens futuras do mesmo número.
-
+// Fluxo: /w (captura code+UTMs e redireciona p/ WhatsApp) → usuário envia código → bot pede nome
+// → salva em Sheets + envia p/ Leadlovers → confirma + link do grupo → ignora mensagens futuras
 "use strict";
 
 const express = require("express");
@@ -10,35 +9,50 @@ const crypto = require("crypto");
 const app = express();
 app.use(express.json({ type: "*/*" }));
 
-// ====== Env ======
+/* ========= ENV ========= */
 const PORT = process.env.PORT || 3000;
 
 // WhatsApp Cloud API
-const WA_VERIFY_TOKEN = process.env.WA_VERIFY_TOKEN;                 // ex: KSdie832nNS2332Si340AsN
-const WA_PHONE_NUMBER_ID = process.env.WA_PHONE_NUMBER_ID;           // ex: 734469813083767
-const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;                   // long token do Meta
+const WA_VERIFY_TOKEN = process.env.WA_VERIFY_TOKEN;
+const WA_PHONE_NUMBER_ID = process.env.WA_PHONE_NUMBER_ID;
+const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
 
-// Redis (Upstash)
-const UPSTASH_URL = process.env.UPSTASH_REDIS_REST_URL;              // ex: https://xxxxx.upstash.io
-const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;          // ex: xxx
+// Upstash Redis (REST)
+const UPSTASH_URL = process.env.UPSTASH_REDIS_REST_URL;
+const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
 const CODE_TTL_SECONDS = Number(process.env.CODE_TTL_SECONDS || 86400);
 
+// Mensagem inicial e telefone de destino
+// Suporta {code} ou #{code} no template
+const DEFAULT_MESSAGE =
+  process.env.DEFAULT_MESSAGE ||
+  `Quero participar do evento, meu código é #{code}\n\n*Envie o código para confirmar sua inscrição!*`;
+const TARGET_PHONE_ENV =
+  process.env.WHATSAPP_REDIRECT_PHONE ||
+  process.env.WHATSAPP_PHONE ||
+  process.env.WA_TARGET_PHONE ||
+  process.env.TARGET_PHONE ||
+  process.env.DEFAULT_TO_PHONE ||
+  "";
+
 // Google Apps Script (Sheets)
-const SHEETS_WEBHOOK_URL = process.env.SHEETS_WEBHOOK_URL;           // seu webhook do Apps Script
-const SHEETS_SECRET = process.env.SHEETS_SECRET;                     // gu1t4r_h34v1m3t4l765
+const SHEETS_WEBHOOK_URL = process.env.SHEETS_WEBHOOK_URL;
+const SHEETS_SECRET = process.env.SHEETS_SECRET;
+// defaults pedidos por você
 const SHEETS_DOC_NAME = process.env.SHEETS_DOC_NAME || "UTM Logs";
 const SHEETS_TAB_NAME = process.env.SHEETS_TAB_NAME || "UTMs Leads WhatsApp";
 
 // Leadlovers
-const LEADLOVERS_URL = process.env.LEADLOVERS_URL;                   // https://api.zaplovers.com/api/cloudapi/webhooks
-const LEADLOVERS_TOKEN = process.env.LEADLOVERS_TOKEN;               // llwa-...
+const LEADLOVERS_URL = process.env.LEADLOVERS_URL;
+const LEADLOVERS_TOKEN = process.env.LEADLOVERS_TOKEN;
 
 // Link do grupo VIP
-const GROUP_LINK = process.env.GROUP_LINK || "https://go.doutorpastagem.com.br/grupo-vivendo-pecuaria-leite";
+const GROUP_LINK =
+  process.env.GROUP_LINK ||
+  "https://go.doutorpastagem.com.br/grupo-vivendo-pecuaria-leite";
 
-// ====== Helpers ======
+/* ========= HELPERS ========= */
 function makeTid(len = 8) {
-  // Gera um ID curto [a-zA-Z0-9]
   return crypto
     .randomBytes(Math.ceil((len * 3) / 4))
     .toString("base64")
@@ -46,59 +60,72 @@ function makeTid(len = 8) {
     .slice(0, len);
 }
 
-async function upstashGet(key) {
+function sanitizePhone(raw) {
+  const digits = String(raw || "").replace(/\D/g, "");
+  return /^\d{10,15}$/.test(digits) ? digits : null;
+}
+function resolvePhone(queryPhone) {
+  return sanitizePhone(queryPhone) || sanitizePhone(TARGET_PHONE_ENV);
+}
+
+function renderDefaultMessage(code, tid) {
+  let msg = DEFAULT_MESSAGE;
+  msg = msg.replace(/\#\{code\}/g, `#${code}`);
+  msg = msg.replace(/\{code\}/g, `${code}`);
+  // sempre anexa o TID para casar clique x conversa
+  return `${msg}  (TID:${tid})`;
+}
+
+/* ========= UPSTASH (STORE) ========= */
+async function rget(key) {
   const res = await fetch(`${UPSTASH_URL}/get/${encodeURIComponent(key)}`, {
     headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` },
   });
-  const j = await res.json();
+  const j = await res.json().catch(() => null);
   return j?.result ? JSON.parse(j.result) : null;
 }
-
-async function upstashSet(key, value, ttlSec) {
+async function rset(key, value, ttlSec) {
   const body = JSON.stringify(value);
   const res = await fetch(
-    `${UPSTASH_URL}/set/${encodeURIComponent(key)}/${encodeURIComponent(body)}?EX=${ttlSec}`,
-    {
-      method: "POST",
-      headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` },
-    }
+    `${UPSTASH_URL}/set/${encodeURIComponent(key)}/${encodeURIComponent(
+      body
+    )}?EX=${ttlSec}`,
+    { method: "POST", headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` } }
   );
-  return res.json();
+  return res.json().catch(() => null);
 }
-
-async function upstashDel(key) {
+async function rdel(key) {
   const res = await fetch(`${UPSTASH_URL}/del/${encodeURIComponent(key)}`, {
     method: "POST",
     headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` },
   });
-  return res.json();
+  return res.json().catch(() => null);
 }
 
-// Store (Redis)
 async function saveClick(tid, data) {
-  return upstashSet(`click:${tid}`, data, CODE_TTL_SECONDS);
+  return rset(`click:${tid}`, data, CODE_TTL_SECONDS);
 }
 async function getClick(tid) {
-  return upstashGet(`click:${tid}`);
+  return rget(`click:${tid}`);
 }
 async function setState(wa_id, state) {
-  return upstashSet(`state:${wa_id}`, state, CODE_TTL_SECONDS);
+  return rset(`state:${wa_id}`, state, CODE_TTL_SECONDS);
 }
 async function getState(wa_id) {
-  return upstashGet(`state:${wa_id}`);
+  return rget(`state:${wa_id}`);
 }
 async function clearState(wa_id) {
-  return upstashDel(`state:${wa_id}`);
+  return rdel(`state:${wa_id}`);
 }
 async function markCompleted(wa_id) {
-  return upstashSet(`done:${wa_id}`, { done: true }, CODE_TTL_SECONDS);
+  return rset(`done:${wa_id}`, { done: true }, CODE_TTL_SECONDS);
 }
 async function isCompleted(wa_id) {
-  const v = await upstashGet(`done:${wa_id}`);
+  const v = await rget(`done:${wa_id}`);
   return !!v?.done;
 }
 
-// WhatsApp API
+/* ========= INTEGRATIONS ========= */
 async function sendWhatsAppText(to, body) {
   const url = `https://graph.facebook.com/v20.0/${WA_PHONE_NUMBER_ID}/messages`;
   const payload = {
@@ -116,12 +143,10 @@ async function sendWhatsAppText(to, body) {
     body: JSON.stringify(payload),
   });
   if (!res.ok) {
-    const errText = await res.text();
-    console.error("WhatsApp API error:", res.status, errText);
+    console.error("WhatsApp API error:", res.status, await res.text());
   }
 }
 
-// Sheets (Apps Script)
 async function saveRowToSheets(row) {
   const payload = {
     secret: SHEETS_SECRET,
@@ -135,14 +160,21 @@ async function saveRowToSheets(row) {
     body: JSON.stringify(payload),
   });
   if (!res.ok) {
-    const t = await res.text();
-    throw new Error(`Sheets error ${res.status}: ${t}`);
+    throw new Error(`Sheets error ${res.status}: ${await res.text()}`);
   }
   return res.json();
 }
 
-// Leadlovers
-async function sendToLeadlovers({ phone, name, code, utm_source, utm_campaign, utm_medium, utm_content, utm_term }) {
+async function sendToLeadlovers({
+  phone,
+  name,
+  code,
+  utm_source,
+  utm_campaign,
+  utm_medium,
+  utm_content,
+  utm_term,
+}) {
   const payload = {
     token: LEADLOVERS_TOKEN,
     phone,
@@ -160,8 +192,7 @@ async function sendToLeadlovers({ phone, name, code, utm_source, utm_campaign, u
     body: JSON.stringify(payload),
   });
   if (!res.ok) {
-    const t = await res.text();
-    throw new Error(`Leadlovers error ${res.status}: ${t}`);
+    throw new Error(`Leadlovers error ${res.status}: ${await res.text()}`);
   }
   return res.json();
 }
@@ -170,20 +201,31 @@ function extractMessageText(msg) {
   return (
     (msg.text && msg.text.body) ||
     (msg.button && msg.button.text) ||
-    (msg.interactive && msg.interactive.button_reply && msg.interactive.button_reply.title) ||
+    (msg.interactive &&
+      msg.interactive.button_reply &&
+      msg.interactive.button_reply.title) ||
     ""
   ).trim();
 }
 
-// ====== Rotas ======
+/* ========= ROUTES ========= */
 
-// Link de redirecionamento (SEM CTWA), captura code+UTMs e redireciona para wa.me
-// Uso:
-// https://wa.doutorpastagem.com.br/w?phone=55DDDNXXXXXXXX&code=ABC123&utm_source=instagram&utm_medium=bio&utm_campaign=evento&utm_content=post1&utm_term=xyz
+// 1) Link de redirecionamento (sem CTWA)
+// Ex.: https://SEU-DOMINIO/w?code=ABC123&utm_source=instagram&utm_medium=bio...
+// Se ?phone= não vier, usa TARGET_PHONE (env)
 app.get("/w", async (req, res) => {
   try {
-    const { phone, code, ...utms } = req.query;
-    if (!phone || !code) return res.status(400).send("phone e code são obrigatórios");
+    const { code, phone, ...utms } = req.query;
+    if (!code) return res.status(400).send("code é obrigatório");
+
+    const phoneDigits = resolvePhone(phone);
+    if (!phoneDigits) {
+      return res
+        .status(400)
+        .send(
+          "phone ausente ou inválido. Configure TARGET_PHONE no Render (ex.: 5511999999999) ou envie ?phone=..."
+        );
+    }
 
     const tid = makeTid(8);
     await saveClick(tid, {
@@ -196,11 +238,10 @@ app.get("/w", async (req, res) => {
       utm_term: utms.utm_term || null,
     });
 
-    const text =
-      `Quero participar do evento, meu código é #${code}\n\n` +
-      `*Envie o código para confirmar sua inscrição!*  (TID:${tid})`;
-
-    const href = `https://wa.me/${phone}?text=${encodeURIComponent(text)}`;
+    const text = renderDefaultMessage(code, tid);
+    const href = `https://api.whatsapp.com/send?phone=${phoneDigits}&text=${encodeURIComponent(
+      text
+    )}`;
     return res.redirect(href);
   } catch (e) {
     console.error("Route /w error:", e);
@@ -208,35 +249,37 @@ app.get("/w", async (req, res) => {
   }
 });
 
-// Verificação do Webhook (Meta)
+// 2) Verificação do Webhook do Meta
 app.get("/webhook", (req, res) => {
   try {
     const mode = req.query["hub.mode"];
     const challenge = req.query["hub.challenge"];
     const verifyToken = req.query["hub.verify_token"];
-    if (mode === "subscribe" && verifyToken === WA_VERIFY_TOKEN) return res.status(200).send(challenge);
+    if (mode === "subscribe" && verifyToken === WA_VERIFY_TOKEN) {
+      return res.status(200).send(challenge);
+    }
     return res.sendStatus(403);
   } catch {
     return res.sendStatus(403);
   }
 });
 
-// Recebimento de mensagens do WhatsApp
+// 3) Recebimento dos eventos WhatsApp
 app.post("/webhook", async (req, res) => {
   try {
     const entry = req.body?.entry?.[0];
     const value = entry?.changes?.[0]?.value;
     const messages = value?.messages || [];
-    if (!messages.length) return res.sendStatus(200); // sempre 200 pro Meta
+    if (!messages.length) return res.sendStatus(200);
 
     for (const m of messages) {
       const wa_id = m.from;
       const txt = extractMessageText(m);
 
-      // Se já concluído, ignora mensagens futuras
+      // Se já concluído, ignorar mensagens futuras
       if (await isCompleted(wa_id)) continue;
 
-      // Se aguardando nome: qualquer texto vira nome
+      // Se aguardando nome → qualquer texto é nome
       const state = await getState(wa_id);
       if (state?.awaiting_name && txt) {
         const click = state.click || (state.tid ? await getClick(state.tid) : null);
@@ -253,39 +296,37 @@ app.post("/webhook", async (req, res) => {
           utm_term: click?.utm_term || null,
         };
 
-        // Grava em Sheets
+        // 3.1) Sheets
         try {
           await saveRowToSheets(row);
         } catch (e) {
           console.error("Sheets error:", e.message || e);
         }
 
-        // Envia para Leadlovers
+        // 3.2) Leadlovers
         try {
           await sendToLeadlovers(row);
         } catch (e) {
           console.error("Leadlovers error:", e.message || e);
         }
 
-        // Confirmação com resumo + link do grupo
-        const confirmMsg =
+        // 3.3) Confirmação com resumo + link do grupo
+        const confirm =
           `✅ *Inscrição confirmada!*\n` +
           `Nome: *${row.name}*\n` +
           `Código: *${row.code || "-"}*\n\n` +
           `Clique no link abaixo para entrar no *Grupo VIP do evento*:\n` +
           `📎 ${GROUP_LINK}`;
-
-        await sendWhatsAppText(wa_id, confirmMsg);
+        await sendWhatsAppText(wa_id, confirm);
 
         await clearState(wa_id);
         await markCompleted(wa_id);
         continue;
       }
 
-      // Primeira mensagem: procurar #CODE e TID:xxxx
+      // Primeira mensagem: deve conter #CODE e TID:xxxx (que veio do /w)
       const codeMatch = txt.match(/#([A-Z0-9_-]{3,20})/i);
       const tidMatch = txt.match(/TID:([a-zA-Z0-9_-]{5,20})/);
-
       if (codeMatch) {
         const code = codeMatch[1].toUpperCase();
         const tid = tidMatch?.[1] || null;
@@ -302,7 +343,7 @@ app.post("/webhook", async (req, res) => {
         continue;
       }
 
-      // Padrão não reconhecido
+      // Caso não reconheça o padrão
       const help =
         `Não consegui identificar seu código.\n\n` +
         `Por favor, envie a mensagem inicial ou digite seu código no formato:\n` +
@@ -317,10 +358,7 @@ app.post("/webhook", async (req, res) => {
   }
 });
 
-// Healthcheck
+/* ========= HEALTH ========= */
 app.get("/health", (_, res) => res.send("ok"));
 
-// Start
-app.listen(PORT, () => {
-  console.log(`listening on :${PORT}`);
-});
+app.listen(PORT, () => console.log(`listening on :${PORT}`));
