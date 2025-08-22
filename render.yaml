@@ -1,0 +1,36 @@
+services:
+  - type: web
+    name: wa-event-reg
+    env: node
+    plan: free
+    buildCommand: "npm install"
+    startCommand: "node index.js"
+    healthCheckPath: "/health"
+    autoDeploy: true
+    envVars:
+      - key: WA_VERIFY_TOKEN
+        sync: false
+      - key: WA_PHONE_NUMBER_ID
+        sync: false
+      - key: WHATSAPP_TOKEN
+        sync: false
+      - key: UPSTASH_REDIS_REST_URL
+        sync: false
+      - key: UPSTASH_REDIS_REST_TOKEN
+        sync: false
+      - key: CODE_TTL_SECONDS
+        value: "86400"
+      - key: SHEETS_WEBHOOK_URL
+        sync: false
+      - key: SHEETS_SECRET
+        sync: false
+      - key: SHEETS_DOC_NAME
+        value: "UTM Logs"
+      - key: SHEETS_TAB_NAME
+        value: "UTMs Leads WhatsApp"
+      - key: LEADLOVERS_URL
+        sync: false
+      - key: LEADLOVERS_TOKEN
+        sync: false
+      - key: GROUP_LINK
+        value: "https://go.doutorpastagem.com.br/grupo-vivendo-pecuaria-leite"
